@@ -5,26 +5,18 @@ cd /d "%~dp0"
 REM ===========================================================================
 REM  QR File Share - one-click launcher
 REM
-REM    start.cmd            run on localhost:8000
-REM    start.cmd lan        bind to the LAN so a real phone can scan the QR
-REM    start.cmd 9000       run on a different port
-REM    start.cmd lan 9000   both
+REM    start.cmd          start the app and open it in the browser
+REM    start.cmd 9000     use a different port
+REM
+REM  The app listens on this laptop only (127.0.0.1). Nothing on the network can
+REM  connect to it. QR codes are served by Google Drive, not by this laptop.
 REM
 REM  Safe to run repeatedly: it reuses the existing .venv and never overwrites
 REM  an existing .env.
 REM ===========================================================================
 
-set "HOSTBIND=127.0.0.1"
 set "PORT=8000"
-set "LANMODE="
-
-for %%A in (%1 %2) do (
-    if /i "%%A"=="lan" (
-        set "LANMODE=1"
-    ) else (
-        set "PORT=%%A"
-    )
-)
+if not "%~1"=="" set "PORT=%~1"
 
 echo.
 echo  ====================================================
@@ -64,9 +56,9 @@ if exist "%VENV_PY%" (
 )
 
 REM --- 2. dependencies --------------------------------------------------------
-"%VENV_PY%" -c "import fastapi, uvicorn, qrcode, jinja2, pydantic_settings" >nul 2>&1
+"%VENV_PY%" -c "import fastapi, uvicorn, qrcode, jinja2, pydantic_settings, google_auth_oauthlib, keyring, googleapiclient" >nul 2>&1
 if errorlevel 1 (
-    echo [2/4] Installing dependencies. First run only - this takes a minute...
+    echo [2/4] Installing dependencies. This takes a minute the first time...
     "%VENV_PY%" -m pip install --quiet --upgrade pip
     "%VENV_PY%" -m pip install --quiet -r requirements.txt
     if errorlevel 1 (
@@ -82,7 +74,7 @@ if errorlevel 1 (
 )
 
 REM --- 3. configuration -------------------------------------------------------
-"%VENV_PY%" tools\setup_helper.py bootstrap %PORT%
+"%VENV_PY%" tools\setup_helper.py bootstrap
 if errorlevel 1 (
     echo  ERROR: could not prepare .env
     pause
@@ -90,30 +82,20 @@ if errorlevel 1 (
 )
 
 REM --- 4. launch --------------------------------------------------------------
-REM BASE_URL is baked into every QR at generation time, so it must match the origin
-REM the server is really reachable at. The helper keeps a production BASE_URL from
-REM .env, but re-derives a local one from the port actually in use -- otherwise a QR
-REM generated after "start.cmd 9000" would still encode yesterday's port.
-if defined LANMODE (
-    for /f "usebackq tokens=*" %%i in (`"%VENV_PY%" tools\setup_helper.py baseurl %PORT% lan`) do set "BASE_URL=%%i"
-    set "HOSTBIND=0.0.0.0"
-    echo [4/4] Starting on the local network...
-    echo.
-    echo       Your phone must be on the SAME Wi-Fi network.
-    echo       Windows Firewall may ask for permission - click Allow.
-) else (
-    for /f "usebackq tokens=*" %%i in (`"%VENV_PY%" tools\setup_helper.py baseurl %PORT%`) do set "BASE_URL=%%i"
-    echo [4/4] Starting on localhost...
-)
-
-"%VENV_PY%" tools\setup_helper.py summary "!BASE_URL!"
+echo [4/4] Starting...
+"%VENV_PY%" tools\setup_helper.py summary %PORT%
 
 echo  ----------------------------------------------------
-echo   Press CTRL+C to stop the server.
+echo   The app opens in your browser in a moment.
+echo   Keep this window open while you use it.
+echo   Press CTRL+C here to stop.
 echo  ----------------------------------------------------
 echo.
 
-"%VENV_PY%" -m uvicorn app.main:app --host %HOSTBIND% --port %PORT%
+REM Opens the browser once the server answers, without holding up the launch.
+start "" /b "%VENV_PY%" tools\setup_helper.py openwhenready %PORT%
+
+"%VENV_PY%" -m uvicorn app.main:app --host 127.0.0.1 --port %PORT%
 
 echo.
 echo  Server stopped.

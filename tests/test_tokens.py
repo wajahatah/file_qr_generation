@@ -1,49 +1,107 @@
-"""Token properties. The token IS the access control, so its entropy is load-bearing."""
+"""Where the Google sign-in token is kept (app/tokens.py)."""
 
 from __future__ import annotations
 
-import re
-import string
+import json
+import os
+import stat
+from types import SimpleNamespace
 
-from app.db import new_token
+import pytest
 
-URLSAFE = set(string.ascii_letters + string.digits + "-_")
-
-
-def test_token_is_url_safe() -> None:
-    for _ in range(1000):
-        assert set(new_token()) <= URLSAFE
+from app.tokens import FileStore, KeyringStore, build_token_store
 
 
-def test_token_length_matches_128_bits() -> None:
-    # secrets.token_urlsafe(16) -> 16 bytes -> 22 base64url chars, no padding.
-    token = new_token()
-    assert len(token) == 22
-    assert "=" not in token
+class FakeKeyring:
+    def __init__(self):
+        self.store = {}
+
+    def get_password(self, s, u):
+        return self.store.get((s, u))
+
+    def set_password(self, s, u, v):
+        self.store[(s, u)] = v
+
+    def delete_password(self, s, u):
+        self.store.pop((s, u), None)
 
 
-def test_tokens_are_unique_at_scale() -> None:
-    """100k draws with zero collisions.
-
-    This does not prove 128-bit entropy, but it would catch the classic regressions:
-    a seeded PRNG, a truncated token, or a counter dressed up as a token.
-    """
-    tokens = {new_token() for _ in range(100_000)}
-    assert len(tokens) == 100_000
+# ------------------------------------------------------------------ file store
 
 
-def test_tokens_are_not_sequential() -> None:
-    """Consecutive tokens must share no common prefix beyond chance."""
-    a, b = new_token(), new_token()
-    common = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        common += 1
-    assert common < 6, f"tokens look sequential: {a} / {b}"
+def test_file_store_round_trip(tmp_path):
+    store = FileStore(tmp_path / "data" / "google-token.json")
+    assert store.get() is None
+    store.set("refresh-abc")
+    assert store.get() == "refresh-abc"
+    store.set("refresh-def")
+    assert store.get() == "refresh-def"
 
 
-def test_token_fits_a_short_url() -> None:
-    url = f"https://qr.example.com/d/{new_token()}"
-    assert len(url) < 60, "keep the QR payload small enough to print at ~2cm"
-    assert re.fullmatch(r"https://[\w.\-]+/d/[\w\-]{22}", url)
+def test_file_store_holds_only_the_token(tmp_path):
+    path = tmp_path / "t.json"
+    FileStore(path).set("refresh-abc")
+    assert json.loads(path.read_text(encoding="utf-8")) == {"refresh_token": "refresh-abc"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes; Docker runs on Linux")
+def test_file_store_is_private_to_the_app_user(tmp_path):
+    path = tmp_path / "t.json"
+    FileStore(path).set("refresh-abc")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_file_store_write_is_atomic(tmp_path):
+    path = tmp_path / "t.json"
+    FileStore(path).set("refresh-abc")
+    assert not (tmp_path / "t.json.tmp").exists(), "no half-written temp file left behind"
+
+
+def test_file_store_delete_is_idempotent(tmp_path):
+    store = FileStore(tmp_path / "t.json")
+    store.set("x")
+    store.delete()
+    store.delete()
+    assert store.get() is None
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"other": 1}', '{"refresh_token": ""}'])
+def test_file_store_treats_a_damaged_file_as_not_signed_in(tmp_path, content):
+    path = tmp_path / "t.json"
+    path.write_text(content, encoding="utf-8")
+    assert FileStore(path).get() is None
+
+
+# --------------------------------------------------------------- keyring store
+
+
+def test_keyring_store_round_trip():
+    kr = FakeKeyring()
+    store = KeyringStore(kr)
+    store.set("refresh-abc")
+    assert store.get() == "refresh-abc"
+    store.delete()
+    assert store.get() is None and kr.store == {}
+
+
+def test_keyring_store_survives_a_broken_backend():
+    class Broken:
+        def get_password(self, *a):
+            raise RuntimeError("no backend")
+
+        def delete_password(self, *a):
+            raise RuntimeError("no backend")
+
+    store = KeyringStore(Broken())
+    assert store.get() is None
+    store.delete()  # must not raise
+
+
+# -------------------------------------------------------------------- choosing
+
+
+def test_native_uses_credential_manager_and_docker_uses_the_file(tmp_path):
+    native = build_token_store(SimpleNamespace(token_store="keyring", token_file=tmp_path / "x"))
+    docker = build_token_store(SimpleNamespace(token_store="file", token_file=tmp_path / "t.json"))
+    assert isinstance(native, KeyringStore)
+    assert isinstance(docker, FileStore) and docker.path == tmp_path / "t.json"

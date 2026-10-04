@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QR File Share</title>
+  <link rel="icon" href="/static/icons/favicon-32.png">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <meta name="theme-color" content="#2952cc">
+  <link rel="stylesheet" href="/static/admin.css">
+  <script src="/static/admin.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/static/icons/icon-192.png" alt="" width="28" height="28">
+      QR File Share
+    </div>
+    <div class="topbar-right">
+      <span id="drive-pill" class="pill">Checking Google Drive…</span>
+      <button id="open-settings" class="ghost" type="button">Settings</button>
+      <form method="post" action="/admin/logout">
+        <button class="ghost" type="submit">Log out</button>
+      </form>
+    </div>
+  </header>
+
+  <main>
+    <!-- Shown until Google Drive is connected. -->
+    <section id="drive-card" class="card notice" hidden>
+      <h2 id="drive-card-title">Connect Google Drive</h2>
+      <p id="drive-card-text"></p>
+      <button id="connect-drive" class="primary" type="button">Connect Google Drive</button>
+      <a id="drive-signin-link" class="btn primary" target="_blank" rel="noopener noreferrer" hidden>Continue to Google</a>
+    </section>
+
+    <!-- Shown only when the app's time zone differs from the laptop's. -->
+    <section id="tz-warning" class="card warn" role="status" hidden><p id="tz-warning-text"></p></section>
+
+    <!-- Shown only when expired QR codes are still live on Drive. -->
+    <section id="sweep-warning" class="card warn" role="status" hidden><p id="sweep-warning-text"></p></section>
+
+    <div id="layout" class="layout">
+      <section id="issue" class="card" aria-labelledby="issue-h">
+        <h2 id="issue-h">New QR code</h2>
+
+        <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a PDF file">
+          <p class="drop-main">Drop a PDF here</p>
+          <p class="drop-sub">or click to choose a file</p>
+        </div>
+        <input id="file-input" type="file" accept="application/pdf,.pdf" hidden>
+
+        <div id="chosen" class="chosen" hidden>
+          <div>
+            <div id="chosen-name" class="chosen-name"></div>
+            <div id="chosen-size" class="chosen-size"></div>
+          </div>
+          <button id="clear-file" class="link" type="button">Change file</button>
+        </div>
+
+        <label class="field">
+          <span class="lbl">Label <span class="hint">only you see this</span></span>
+          <input id="label" type="text" maxlength="200" placeholder="e.g. Quotation 4130334" autocomplete="off">
+        </label>
+
+        <fieldset class="field">
+          <legend>How long should this QR code work?</legend>
+          <div id="presets" class="presets" role="group" aria-label="Time limit"></div>
+          <div class="pick-date">
+            <label for="until">or pick a date</label>
+            <input id="until" type="date">
+          </div>
+          <p id="limit-sentence" class="sentence" aria-live="polite"></p>
+          <p class="note">
+            The link is removed by this app. If the laptop is off when the time is up,
+            it is removed the next time the app starts.
+          </p>
+        </fieldset>
+
+        <button id="create" class="primary big" type="button" disabled>Create QR code</button>
+        <p id="create-hint" class="muted note"></p>
+        <p id="issue-error" class="error" role="alert" hidden></p>
+      </section>
+
+      <section id="result" class="card result" aria-live="polite" hidden>
+        <h2>QR code ready</h2>
+        <img id="result-qr" class="qr" alt="QR code for the shared file" width="260" height="260">
+        <p id="result-label" class="result-label"></p>
+        <p id="result-until" class="sentence"></p>
+        <div class="actions">
+          <a id="result-download" class="btn" download>Download PNG</a>
+          <button id="result-copy-img" type="button">Copy image</button>
+          <button id="result-copy-link" type="button">Copy link</button>
+          <button id="result-print" type="button">Print</button>
+        </div>
+        <button id="new-qr" class="link" type="button">Make another QR code</button>
+      </section>
+    </div>
+
+    <section class="card" aria-labelledby="links-h">
+      <div class="section-head">
+        <h2 id="links-h">Issued QR codes</h2>
+        <span id="links-count" class="muted"></span>
+      </div>
+      <p id="links-empty" class="muted" hidden>No QR codes yet. Make one above.</p>
+      <ul id="links" class="links"></ul>
+    </section>
+  </main>
+
+  <!-- Change the limit of an issued QR code, or reactivate an expired one. -->
+  <dialog id="dlg-limit" aria-labelledby="dlg-limit-title">
+    <div class="dlg">
+      <h3 id="dlg-limit-title">Change time limit</h3>
+      <p id="dlg-limit-current" class="muted"></p>
+      <div id="dlg-limit-choices" class="presets" role="group" aria-label="New limit"></div>
+      <div class="pick-date">
+        <label for="dlg-until">or pick a date</label>
+        <input id="dlg-until" type="date">
+      </div>
+      <p id="dlg-limit-sentence" class="sentence" aria-live="polite"></p>
+      <p id="dlg-limit-note" class="note"></p>
+      <div class="dlg-actions">
+        <button id="dlg-limit-cancel" class="ghost" type="button">Cancel</button>
+        <button id="dlg-limit-save" class="primary" type="button" disabled>Save</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Show an issued QR code again. -->
+  <dialog id="dlg-qr" aria-labelledby="dlg-qr-title">
+    <div class="dlg center">
+      <h3 id="dlg-qr-title"></h3>
+      <img id="dlg-qr-img" class="qr" alt="QR code" width="260" height="260">
+      <p id="dlg-qr-status" class="muted"></p>
+      <div class="actions">
+        <a id="dlg-qr-download" class="btn" download>Download PNG</a>
+        <button id="dlg-qr-copy-img" type="button">Copy image</button>
+        <button id="dlg-qr-copy-link" type="button">Copy link</button>
+        <button id="dlg-qr-print" type="button">Print</button>
+      </div>
+      <div class="dlg-actions">
+        <button id="dlg-qr-close" class="ghost" type="button">Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Generic confirmation. -->
+  <dialog id="dlg-confirm" aria-labelledby="dlg-confirm-title">
+    <div class="dlg">
+      <h3 id="dlg-confirm-title"></h3>
+      <p id="dlg-confirm-text"></p>
+      <div class="dlg-actions">
+        <button id="dlg-confirm-cancel" class="ghost" type="button">Cancel</button>
+        <button id="dlg-confirm-ok" class="danger solid" type="button"></button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="dlg-settings" aria-labelledby="dlg-settings-title">
+    <div class="dlg">
+      <h3 id="dlg-settings-title">Settings</h3>
+      <label class="field">
+        <span class="lbl">New QR codes last</span>
+        <select id="default-preset"></select>
+      </label>
+      <p id="settings-saved" class="msg"></p>
+
+      <h4>Time zone</h4>
+      <p id="settings-tz-text" class="muted"></p>
+
+      <h4>Google Drive</h4>
+      <p id="settings-drive-text" class="muted"></p>
+      <button id="disconnect-drive" class="danger" type="button" hidden>Disconnect Google Drive</button>
+
+      <div class="dlg-actions">
+        <button id="dlg-settings-close" class="primary" type="button">Done</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

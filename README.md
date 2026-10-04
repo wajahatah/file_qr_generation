@@ -1,70 +1,77 @@
 # QR File Share
 
-Generate a QR code that delivers a PDF. Scanning it downloads the document — subject
-to expiry, a download cap, and revocation, with every scan logged.
+Turn a PDF into a QR code. Anyone who scans it opens the PDF from **your Google
+Drive** — even when this laptop is off. Every QR code has a **time limit** you choose;
+when it runs out, the app removes the file from sharing.
 
-Built for sending quotations to customers: issue a QR, send it, see when it was
-opened, kill the link when the quote is superseded.
+Built for sending quotations: drop in the PDF, pick how long it should work, send or
+print the QR code. Extend it, end it, or bring it back later — without ever reprinting
+the QR code.
 
 ## Run it
 
-```
-start.cmd
-```
+**New here? Read [HOW-TO-RUN.md](HOW-TO-RUN.md)** — short, simple steps: what to add,
+where to put it, and how to start the app.
 
-That is all. First run creates the virtual environment, installs dependencies and
-generates an admin token; later runs reuse them. Then open
-<http://localhost:8000/docs>.
+In short: put your Google key file `client_secret.json` next to `start.cmd`, then
+double-click **`start.cmd`**. The app opens in your browser.
 
-| Command | Result |
-|---|---|
-| `start.cmd` | localhost:8000 |
-| `start.cmd lan` | binds to your Wi-Fi so a **phone can scan the QR** |
-| `start.cmd 9000` | different port |
+**Or with Docker:** double-click **`docker-start.cmd`** instead — it runs in the
+background and starts with Docker Desktop. See HOW-TO-RUN.md, "Run with Docker".
 
-Tests: `.venv\Scripts\python.exe -m pytest` (81 tests, all offline).
-
-```bash
-curl -X POST http://localhost:8000/api/files \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -F "file=@samples/90374749.pdf" \
-  -F "expires_in_days=7" -F "max_downloads=2" \
-  -F "label=Quotation 4130334 v1"
-```
-
-Returns a token, a URL, and the QR as a base64 PNG.
+**On another laptop:** `make-kit.cmd` makes one zip with the app ready-built; unzip
+it there, add `client_secret.json`, double-click `docker-start.cmd`. See the setup
+guide, §10.
 
 ## Documentation
 
-- **[docs/setup-guide.md](docs/setup-guide.md)** — start here: running it, scanning
-  from a phone, and where to put your Google Drive service account key and folder ID.
-- **[docs/qr-file-share.md](docs/qr-file-share.md)** — feature docs: API, access rules,
-  storage backends, deployment, limitations.
-- **[docs/planning/spec-qr-file-share.md](docs/planning/spec-qr-file-share.md)** — the
-  approved design and the decisions behind it.
+- **[HOW-TO-RUN.md](HOW-TO-RUN.md)** — start here: the quick, simple version.
+- **[docs/setup-guide.md](docs/setup-guide.md)** — the full guide: setup, making QR codes,
+  time limits, managing them, troubleshooting.
+- **[docs/qr-file-share.md](docs/qr-file-share.md)** — technical: architecture, how
+  limits are enforced, security, API, tests.
+- **[docs/planning/spec-admin-ui.md](docs/planning/spec-admin-ui.md)** — the approved
+  design and the decisions behind it.
+
+## Tests
+
+```
+.venv\Scripts\python.exe -m pytest
+```
+
+310 tests, all offline — Google Drive is replaced by an in-memory stand-in.
 
 ## Layout
 
 ```
-start.cmd       one-click launcher
+start.cmd        one-click launcher
+docker-start.cmd one-click launcher, Docker (+ docker-stop.cmd)
+make-kit.cmd     builds the portable kit zip for another laptop
+Dockerfile       image; compose.yaml runs it
+HOW-TO-RUN.md    quick guide
 app/
-  main.py       FastAPI routes
-  db.py         SQLite: links + access log
-  storage.py    Storage Protocol; local disk and Google Drive backends
-  qr.py         QR rendering
-  config.py     env-driven settings
-tests/          81 tests
-tools/          launcher helper
-samples/        test fixtures
+  main.py        app, API, removal sweep
+  admin.py       pages
+  service.py     issue / change / end / reactivate / sweep
+  limits.py      time-limit logic
+  drive.py       Google Drive client
+  tokens.py      where the Google sign-in is kept
+  timezone.py    which time zone limits use
+  db.py          SQLite
+  templates/     HTML
+  static/        JS, CSS, icons
+tests/           310 tests; fakes.py; run_fake_server.py
+tools/           start.cmd helper; make_kit.py; kit/ (kit compose + START-HERE)
+samples/         test PDFs
 ```
 
-## Not included
+## History
 
-Quotation/report **generation** is Phase 2. This phase delivers an existing PDF via QR;
-it does not create the document.
+Phase 1 served files from the laptop itself. It was replaced by Google Drive delivery
+so QR codes keep working with the laptop off. It is preserved at git tag
+`phase-1-laptop-delivery`.
 
 ## Note
 
 `samples/90374749.pdf` carries its own QR code. That one is a ZATCA tax stamp — signed
-invoice data for offline verification, not a link — and is unrelated to this system.
-See §9 of the feature docs.
+invoice data for tax verification, not a link — and is unrelated to this app.

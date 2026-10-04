@@ -5,5 +5,10 @@ __pycache__/
 .env
 *.db
 *.db-journal
-storage/
+*.db-wal
+*.db-shm
+*.phase1.bak
+client_secret*.json
 service-account*.json
+data/
+dist/

@@ -1,226 +1,243 @@
-"""SQLite metadata store: the token -> file mapping and the access log.
+"""SQLite store: issued links, admin sessions, and settings.
 
-Concurrency note: the download counter is incremented by a single conditional UPDATE
-(`try_consume_download`) rather than a read-then-write. With `max_downloads = 1` and
-two simultaneous scans, a read-then-write would let both through; the conditional
-UPDATE lets exactly one win, because SQLite serialises writers.
+Threading: connections are opened with check_same_thread=False because FastAPI runs
+sync dependencies and sync route handlers on worker threads that need not be the
+same one. This is safe only because (1) every request and every sweep run opens its
+own connection -- none is shared -- and (2) each connection is used sequentially.
+Preserve both invariants in any change. The library is in serialized mode
+(sqlite3.threadsafety == 3).
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import secrets
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
 
-# Outcomes recorded in access_log. Only "served" returns a file; every other value
-# produces an identical 404 to the visitor (see app/main.py).
-OUTCOME_SERVED = "served"
-OUTCOME_EXPIRED = "expired"
-OUTCOME_REVOKED = "revoked"
-OUTCOME_EXHAUSTED = "exhausted"
-OUTCOME_NOT_FOUND = "not_found"
+from app.limits import to_iso, utcnow
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS links (
-    token          TEXT PRIMARY KEY,
-    storage_ref    TEXT NOT NULL,
-    filename       TEXT NOT NULL,
-    content_type   TEXT NOT NULL DEFAULT 'application/pdf',
-    size_bytes     INTEGER NOT NULL,
-    sha256         TEXT NOT NULL,
-    created_at     TEXT NOT NULL,
-    expires_at     TEXT,
-    max_downloads  INTEGER,
-    download_count INTEGER NOT NULL DEFAULT 0,
-    revoked_at     TEXT,
-    label          TEXT
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    drive_file_id TEXT NOT NULL UNIQUE,
+    drive_url     TEXT NOT NULL,
+    filename      TEXT NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    sha256        TEXT NOT NULL,
+    label         TEXT,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,   -- every QR has a limit: enforced here, not only in the UI
+    revoked_at    TEXT,
+    removed_at    TEXT
 );
 
-CREATE TABLE IF NOT EXISTS access_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    token       TEXT NOT NULL,
-    accessed_at TEXT NOT NULL,
-    ip          TEXT,
-    user_agent  TEXT,
-    outcome     TEXT NOT NULL
+CREATE INDEX IF NOT EXISTS idx_links_due ON links(removed_at, expires_at);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    id_hash    TEXT PRIMARY KEY,   -- SHA-256 of the cookie value; the value itself is never stored
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_access_log_token ON access_log(token);
-CREATE INDEX IF NOT EXISTS idx_access_log_time  ON access_log(accessed_at);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
-def now_iso() -> str:
-    """Current UTC time, ISO-8601, second precision. All stored times use this."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def iso_in_days(days: int | None) -> str | None:
-    if days is None:
-        return None
-    return (
-        (datetime.now(timezone.utc) + timedelta(days=days))
-        .replace(microsecond=0)
-        .isoformat()
-    )
-
-
-def new_token() -> str:
-    """128 bits of entropy, URL-safe, ~22 characters."""
-    return secrets.token_urlsafe(16)
+# ------------------------------------------------------------------ connection
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False is required, not a shortcut: FastAPI runs sync generator
-    # dependencies (get_conn) in a worker thread while `async def` routes run on the
-    # event loop, so the connection is legitimately created and used from different
-    # threads. This is safe here only because of two invariants, which must hold for
-    # any future change to the request path:
-    #   1. one connection per request -- connections are never shared between requests;
-    #   2. accesses within a request are strictly sequential, never concurrent.
-    # The underlying library is in serialized mode (sqlite3.threadsafety == 3).
     conn = sqlite3.connect(db_path, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # WAL lets readers proceed while a writer holds the lock; busy_timeout absorbs
-    # the brief contention when two scans land together.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
-    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
-def init_db(db_path: Path) -> None:
+def _is_phase1_schema(db_path: Path) -> bool:
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(links)")}
+    finally:
+        conn.close()
+    # Phase 1 keyed links by a public `token`; this schema has no such column.
+    return "token" in cols
+
+
+def init_db(db_path: Path) -> Path | None:
+    """Create the schema. Returns the backup path if an old database was set aside.
+
+    A phase-1 database cannot be migrated meaningfully -- its links pointed at the
+    laptop, which no longer serves files. It is renamed, never deleted.
+    """
+    backup: Path | None = None
+    if db_path.exists() and _is_phase1_schema(db_path):
+        backup = db_path.with_name(db_path.name + ".phase1.bak")
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(db_path) + suffix)
+            if src.exists():
+                src.replace(Path(str(backup) + suffix))
+        log.warning("Phase-1 database found; moved to %s", backup)
+
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
     finally:
         conn.close()
+    return backup
 
 
-def create_link(
+# ----------------------------------------------------------------------- links
+
+
+def insert_link(
     conn: sqlite3.Connection,
     *,
-    storage_ref: str,
+    drive_file_id: str,
+    drive_url: str,
     filename: str,
-    content_type: str,
     size_bytes: int,
     sha256: str,
-    expires_at: str | None,
-    max_downloads: int | None,
     label: str | None,
-) -> str:
-    token = new_token()
-    conn.execute(
-        """INSERT INTO links (token, storage_ref, filename, content_type, size_bytes,
-                              sha256, created_at, expires_at, max_downloads, label)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            token,
-            storage_ref,
-            filename,
-            content_type,
-            size_bytes,
-            sha256,
-            now_iso(),
-            expires_at,
-            max_downloads,
-            label,
-        ),
-    )
-    conn.commit()
-    return token
-
-
-def get_link(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM links WHERE token = ?", (token,)).fetchone()
-
-
-def classify(row: sqlite3.Row | None, *, at: str | None = None) -> str:
-    """Decide the outcome for a link WITHOUT mutating it.
-
-    Used for logging the true reason and for the read-only metadata endpoint. The
-    actual serve path must still call `try_consume_download`, which re-checks the
-    same conditions atomically.
-    """
-    if row is None:
-        return OUTCOME_NOT_FOUND
-    now = at or now_iso()
-    if row["revoked_at"] is not None:
-        return OUTCOME_REVOKED
-    # Lexicographic comparison is correct here: all timestamps are stored as
-    # fixed-format UTC ISO-8601 strings.
-    if row["expires_at"] is not None and row["expires_at"] <= now:
-        return OUTCOME_EXPIRED
-    if row["max_downloads"] is not None and row["download_count"] >= row["max_downloads"]:
-        return OUTCOME_EXHAUSTED
-    return OUTCOME_SERVED
-
-
-def try_consume_download(conn: sqlite3.Connection, token: str) -> bool:
-    """Atomically claim one download. Returns False if the link is not serveable.
-
-    This is the single source of truth for "may this scan be served"; `classify` is
-    only advisory.
-    """
+    expires_at: datetime,
+) -> int:
     cur = conn.execute(
-        """UPDATE links
-              SET download_count = download_count + 1
-            WHERE token = ?
-              AND revoked_at IS NULL
-              AND (expires_at IS NULL OR expires_at > ?)
-              AND (max_downloads IS NULL OR download_count < max_downloads)""",
-        (token, now_iso()),
+        """INSERT INTO links (drive_file_id, drive_url, filename, size_bytes, sha256,
+                              label, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (drive_file_id, drive_url, filename, size_bytes, sha256, label,
+         to_iso(utcnow()), to_iso(expires_at)),
     )
     conn.commit()
-    return cur.rowcount == 1
+    return int(cur.lastrowid)
 
 
-def revoke(conn: sqlite3.Connection, token: str) -> bool:
-    cur = conn.execute(
-        "UPDATE links SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL",
-        (now_iso(), token),
-    )
+def delete_link(conn: sqlite3.Connection, link_id: int) -> None:
+    conn.execute("DELETE FROM links WHERE id = ?", (link_id,))
     conn.commit()
-    return cur.rowcount == 1
 
 
-def log_access(
-    conn: sqlite3.Connection,
-    *,
-    token: str,
-    ip: str | None,
-    user_agent: str | None,
-    outcome: str,
-) -> None:
+def get_link(conn: sqlite3.Connection, link_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM links WHERE id = ?", (link_id,)).fetchone()
+
+
+def list_links(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM links ORDER BY id DESC").fetchall()
+
+
+def set_expiry(conn: sqlite3.Connection, link_id: int, expires_at: datetime) -> None:
     conn.execute(
-        """INSERT INTO access_log (token, accessed_at, ip, user_agent, outcome)
-           VALUES (?, ?, ?, ?, ?)""",
-        (token, now_iso(), ip, user_agent, outcome),
+        "UPDATE links SET expires_at = ? WHERE id = ?", (to_iso(expires_at), link_id)
     )
     conn.commit()
 
 
-def access_log_for(conn: sqlite3.Connection, token: str) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT * FROM access_log WHERE token = ? ORDER BY id DESC", (token,)
+def mark_revoked(conn: sqlite3.Connection, link_id: int, when: datetime) -> None:
+    conn.execute(
+        "UPDATE links SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+        (to_iso(when), link_id),
+    )
+    conn.commit()
+
+
+def mark_removed(conn: sqlite3.Connection, link_id: int, when: datetime) -> None:
+    conn.execute(
+        "UPDATE links SET removed_at = ? WHERE id = ? AND removed_at IS NULL",
+        (to_iso(when), link_id),
+    )
+    conn.commit()
+
+
+def mark_restored(conn: sqlite3.Connection, link_id: int, expires_at: datetime) -> None:
+    conn.execute(
+        "UPDATE links SET removed_at = NULL, expires_at = ? WHERE id = ?",
+        (to_iso(expires_at), link_id),
+    )
+    conn.commit()
+
+
+def due_for_removal(conn: sqlite3.Connection, now: datetime) -> list[sqlite3.Row]:
+    """Links whose Drive file must go: past their limit, or ended but not yet trashed.
+
+    The second case is how a failed "End now" (Drive unreachable at that moment) is
+    retried until it succeeds.
+    """
+    return conn.execute(
+        """SELECT * FROM links
+            WHERE removed_at IS NULL
+              AND (expires_at <= ? OR revoked_at IS NOT NULL)""",
+        (to_iso(now),),
     ).fetchall()
-    return [dict(r) for r in rows]
 
 
-def purge_old_logs(conn: sqlite3.Connection, retention_days: int) -> int:
-    cutoff = (
-        (datetime.now(timezone.utc) - timedelta(days=retention_days))
-        .replace(microsecond=0)
-        .isoformat()
+# -------------------------------------------------------------------- settings
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
     )
-    cur = conn.execute("DELETE FROM access_log WHERE accessed_at < ?", (cutoff,))
+    conn.commit()
+
+
+# -------------------------------------------------------------------- sessions
+
+
+def _hash(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def create_session(conn: sqlite3.Connection, hours: int) -> str:
+    """Create a session and return the raw value for the cookie.
+
+    Only its hash is stored, so a copy of the database does not contain a usable
+    session.
+    """
+    raw = secrets.token_urlsafe(32)
+    now = utcnow()
+    conn.execute(
+        "INSERT INTO admin_sessions (id_hash, created_at, expires_at) VALUES (?, ?, ?)",
+        (_hash(raw), to_iso(now), to_iso(now + timedelta(hours=hours))),
+    )
+    conn.commit()
+    return raw
+
+
+def session_valid(conn: sqlite3.Connection, raw: str | None) -> bool:
+    if not raw:
+        return False
+    row = conn.execute(
+        "SELECT expires_at FROM admin_sessions WHERE id_hash = ?", (_hash(raw),)
+    ).fetchone()
+    return row is not None and row["expires_at"] > to_iso(utcnow())
+
+
+def delete_session(conn: sqlite3.Connection, raw: str | None) -> None:
+    if raw:
+        conn.execute("DELETE FROM admin_sessions WHERE id_hash = ?", (_hash(raw),))
+        conn.commit()
+
+
+def purge_expired_sessions(conn: sqlite3.Connection) -> int:
+    cur = conn.execute(
+        "DELETE FROM admin_sessions WHERE expires_at <= ?", (to_iso(utcnow()),)
+    )
     conn.commit()
     return cur.rowcount
-
-
-def iter_links(conn: sqlite3.Connection) -> Iterator[sqlite3.Row]:
-    yield from conn.execute("SELECT * FROM links ORDER BY created_at DESC")

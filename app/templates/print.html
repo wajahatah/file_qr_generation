@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Print QR · {{ label }}</title>
+  <link rel="icon" href="/static/icons/favicon-32.png">
+  <link rel="stylesheet" href="/static/admin.css">
+  <script src="/static/print.js" defer></script>
+</head>
+<body class="print-page" data-live="{{ '1' if live else '0' }}">
+  <div class="print-sheet">
+    {% if not live %}
+    <p class="print-warn">This QR code is no longer active. Anyone who scans it will not be able to open the file.</p>
+    {% endif %}
+    <img id="print-qr" src="/api/links/{{ link_id }}/qr.png" alt="QR code" width="320" height="320">
+    <p class="p-label">{{ label }}</p>
+    <p class="p-instr">Scan with your phone camera to download.</p>
+    <p class="p-until">Available until {{ until }}</p>
+    <div class="print-controls">
+      <button id="print-btn" class="primary" type="button">Print</button>
+    </div>
+  </div>
+</body>
+</html>

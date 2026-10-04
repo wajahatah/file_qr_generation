@@ -1,0 +1,4 @@
+# cmd.exe mis-parses multi-line blocks in batch files with bare LF endings.
+# Force CRLF for them regardless of anyone's core.autocrlf setting.
+*.cmd text eol=crlf
+*.bat text eol=crlf

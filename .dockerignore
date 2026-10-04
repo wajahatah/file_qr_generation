@@ -1,0 +1,7 @@
+# Allow-list: only the app code and its pinned dependencies enter the image.
+# Everything else -- .env, client_secret.json, databases, tests, samples, .venv,
+# git history -- stays out, so no secret can be baked into the image.
+*
+!app/
+!requirements.txt
+**/__pycache__

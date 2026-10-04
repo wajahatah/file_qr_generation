@@ -1,67 +1,63 @@
-"""HTTP layer: auth, upload validation, and the uniform-404 guarantee."""
+"""The HTTP API, end to end through FastAPI, against the fake Drive."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import hashlib
+import io
+from datetime import date, datetime, timedelta
 
-import pytest
+from PIL import Image
+from pyzbar.pyzbar import decode
 
 from app import db
-from tests.conftest import AUTH
+from app.limits import expiry_instant, local_today, utcnow
+from tests.conftest import AUTH, TZ, upload
 
 
-def upload(client, path, **form):
-    with open(path, "rb") as fh:
-        return client.post(
-            "/api/files",
-            headers=AUTH,
-            files={"file": (path.name, fh, "application/pdf")},
-            data=form,
-        )
+def today() -> date:
+    return local_today(utcnow(), TZ)
 
 
-# ----------------------------------------------------------------------- liveness
+def scan(png: bytes) -> str:
+    """Decode a QR image the way a phone camera would."""
+    results = decode(Image.open(io.BytesIO(png)))
+    assert len(results) == 1, f"expected one QR code, found {len(results)}"
+    return results[0].data.decode("utf-8")
 
 
-def test_healthz(client) -> None:
-    assert client.get("/healthz").json() == {"status": "ok"}
+# -------------------------------------------------------------- the whole journey
 
 
-# --------------------------------------------------------------------------- auth
+def test_every_sample_pdf_becomes_a_scannable_qr_for_the_exact_file(client, drive, sample_pdfs):
+    """Upload -> QR image -> decode the pixels -> the link opens exactly this file."""
+    for pdf in sample_pdfs:
+        original = pdf.read_bytes()
+        r = upload(client, pdf)
+        assert r.status_code == 201, r.text
+        link = r.json()
+
+        png = client.get(f"/api/links/{link['id']}/qr.png", headers=AUTH).content
+        scanned = scan(png)
+        assert scanned == link["drive_url"], "the QR must encode the Drive link"
+
+        fid = scanned.split("/file/d/")[1].split("/")[0]
+        assert drive.reachable(fid)
+        stored = drive.files[fid]["data"]
+        assert hashlib.sha256(stored).digest() == hashlib.sha256(original).digest(), pdf.name
 
 
-@pytest.mark.parametrize(
-    "headers",
-    [
-        {},
-        {"Authorization": "Bearer wrong-token"},
-        {"Authorization": "test-admin-token"},  # missing the Bearer scheme
-        {"Authorization": "Basic test-admin-token"},
-        {"Authorization": "Bearer "},
-    ],
-)
-def test_admin_routes_reject_bad_credentials(client, headers, invoice_pdf) -> None:
-    with open(invoice_pdf, "rb") as fh:
-        r = client.post(
-            "/api/files", headers=headers, files={"file": ("x.pdf", fh, "application/pdf")}
-        )
-    assert r.status_code == 401
+def test_the_qr_never_points_at_the_laptop(client, invoice_pdf):
+    link = upload(client, invoice_pdf).json()
+    scanned = scan(client.get(f"/api/links/{link['id']}/qr.png", headers=AUTH).content)
+    assert scanned.startswith("https://drive.google.com/")
+    for local in ("localhost", "127.0.0.1", "192.168.", "10.0."):
+        assert local not in scanned
 
 
-def test_admin_routes_accept_the_configured_token(client, invoice_pdf) -> None:
-    assert upload(client, invoice_pdf).status_code == 201
+# ------------------------------------------------------------------- upload rules
 
 
-def test_public_download_route_needs_no_auth(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    assert client.get(f"/d/{token}").status_code == 200
-
-
-# --------------------------------------------------------------- upload validation
-
-
-def test_rejects_non_pdf_by_magic_bytes(client, tmp_path) -> None:
-    """A .pdf extension is not evidence. The first five bytes are."""
+def test_rejects_non_pdf_by_magic_bytes(client, tmp_path):
     fake = tmp_path / "not-really.pdf"
     fake.write_bytes(b"MZ\x90\x00 this is a windows executable")
     r = upload(client, fake)
@@ -69,13 +65,13 @@ def test_rejects_non_pdf_by_magic_bytes(client, tmp_path) -> None:
     assert "PDF" in r.json()["detail"]
 
 
-def test_rejects_empty_upload(client, tmp_path) -> None:
+def test_rejects_empty_upload(client, tmp_path):
     empty = tmp_path / "empty.pdf"
     empty.write_bytes(b"")
     assert upload(client, empty).status_code == 400
 
 
-def test_rejects_oversized_upload(client, tmp_path, monkeypatch) -> None:
+def test_rejects_oversized_upload(client, tmp_path, monkeypatch):
     from app.config import get_settings
 
     monkeypatch.setenv("MAX_UPLOAD_BYTES", "1024")
@@ -85,159 +81,196 @@ def test_rejects_oversized_upload(client, tmp_path, monkeypatch) -> None:
     assert upload(client, big).status_code == 413
 
 
-@pytest.mark.parametrize("field,value", [("max_downloads", 0), ("expires_in_days", 0)])
-def test_rejects_nonsensical_limits(client, invoice_pdf, field, value) -> None:
-    r = upload(client, invoice_pdf, **{field: value})
-    assert r.status_code == 400
+def test_upload_without_drive_connected_is_refused_cleanly(client, drive, invoice_pdf, env):
+    drive.connected = False
+    r = upload(client, invoice_pdf)
+    assert r.status_code == 409
+    assert "Connect Google Drive" in r.json()["detail"]
+    assert drive.files == {}
 
 
-def test_upload_returns_token_url_and_qr(client, invoice_pdf) -> None:
-    body = upload(client, invoice_pdf).json()
-    assert len(body["token"]) == 22
-    assert body["url"] == f"https://qr.test/d/{body['token']}"
-    assert body["qr_png_base64"]
-    assert body["expires_at"] is not None  # 30-day default applied
+def test_drive_failure_is_reported_not_hidden(client, drive, invoice_pdf):
+    drive.fail_on.add("upload")
+    r = upload(client, invoice_pdf)
+    assert r.status_code == 502
+    assert "Drive" in r.json()["detail"]
 
 
-def test_no_expiry_flag_produces_a_permanent_link(client, invoice_pdf) -> None:
-    body = upload(client, invoice_pdf, no_expiry="true").json()
-    assert body["expires_at"] is None
+def test_label_is_trimmed_and_optional(client, invoice_pdf):
+    assert upload(client, invoice_pdf, label="  Quotation 7  ").json()["label"] == "Quotation 7"
+    assert upload(client, invoice_pdf).json()["label"] is None
 
 
-def test_explicit_expiry_overrides_the_default(client, invoice_pdf) -> None:
-    body = upload(client, invoice_pdf, expires_in_days=1).json()
-    expires = datetime.fromisoformat(body["expires_at"])
-    assert expires < datetime.now(timezone.utc) + timedelta(days=2)
+def test_hostile_filenames_are_cleaned(client, tmp_path):
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.4 test")
+    with open(pdf, "rb") as fh:
+        r = client.post(
+            "/api/links",
+            headers=AUTH,
+            files={"file": ("..\\..\\windows\\evil", fh, "application/pdf")},
+            data={"preset_days": "7"},
+        )
+    assert r.json()["filename"] == "evil.pdf"
 
 
-# -------------------------------------------------------- the uniform-404 guarantee
+# ------------------------------------------------------------------ choosing limits
 
 
-def _make_failing_links(client, invoice_pdf, conn):
-    """One token per failure mode, all of which must look identical from outside.
+def test_every_preset_sets_the_right_last_day(client, invoice_pdf):
+    for days in (1, 3, 7, 30):
+        link = upload(client, invoice_pdf, preset_days=days).json()
+        assert link["last_day"] == (today() + timedelta(days=days)).isoformat(), days
+        assert link["status"]["state"] == "active"
 
-    Each UPDATE is committed before the next HTTP call: an uncommitted write holds
-    SQLite's write lock, and the request would block on it until busy_timeout.
-    """
-    expired = upload(client, invoice_pdf).json()["token"]
-    revoked = upload(client, invoice_pdf).json()["token"]
-    exhausted = upload(client, invoice_pdf, max_downloads=1).json()["token"]
 
-    conn.execute(
-        "UPDATE links SET expires_at = ? WHERE token = ?",
-        ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(), expired),
-    )
-    conn.execute(
-        "UPDATE links SET revoked_at = ? WHERE token = ?", (db.now_iso(), revoked)
-    )
-    conn.commit()
+def test_a_picked_date_sets_that_day(client, invoice_pdf):
+    target = today() + timedelta(days=45)
+    link = upload(client, invoice_pdf, until=target.isoformat()).json()
+    assert link["last_day"] == target.isoformat()
 
-    client.get(f"/d/{exhausted}")  # burn the single download
-    return {
-        db.OUTCOME_EXPIRED: expired,
-        db.OUTCOME_REVOKED: revoked,
-        db.OUTCOME_EXHAUSTED: exhausted,
-        db.OUTCOME_NOT_FOUND: "nonexistenttoken000000",
+
+def test_limit_choice_errors(client, invoice_pdf):
+    past = (today() - timedelta(days=1)).isoformat()
+    too_far = (today() + timedelta(days=366)).isoformat()
+    assert upload(client, invoice_pdf, until=past).status_code == 400
+    assert upload(client, invoice_pdf, until=too_far).status_code == 400
+    assert upload(client, invoice_pdf, preset_days=5).status_code == 400
+    both = upload(client, invoice_pdf, preset_days=7, until=today().isoformat())
+    assert both.status_code == 400
+
+
+def test_preview_sentence_matches_what_is_then_stored(client, invoice_pdf):
+    preview = client.post("/api/limits/preview", json={"preset_days": 30}, headers=AUTH).json()
+    link = upload(client, invoice_pdf, preset_days=30).json()
+    assert preview["last_day"] == link["last_day"]
+    assert preview["sentence"].startswith("Customers can open this until ")
+    assert preview["sentence"].endswith("11:59 PM (30 days)")
+
+
+# ------------------------------------------------------------- managing links
+
+
+def test_list_is_newest_first(client, sample_pdfs):
+    ids = [upload(client, p).json()["id"] for p in sample_pdfs]
+    listed = [l["id"] for l in client.get("/api/links", headers=AUTH).json()["links"]]
+    assert listed == list(reversed(ids))
+
+
+def test_change_limit_via_api(client, invoice_pdf):
+    link = upload(client, invoice_pdf, preset_days=7).json()
+    preview = client.post(f"/api/links/{link['id']}/limit/preview", json={"extend_days": 30}, headers=AUTH).json()
+    changed = client.post(f"/api/links/{link['id']}/limit", json={"extend_days": 30}, headers=AUTH).json()
+    assert changed["last_day"] == preview["last_day"] == (today() + timedelta(days=37)).isoformat()
+    assert changed["drive_url"] == link["drive_url"]
+
+
+def test_end_now_via_api(client, drive, invoice_pdf):
+    link = upload(client, invoice_pdf).json()
+    out = client.post(f"/api/links/{link['id']}/end", headers=AUTH).json()
+    assert out["removed_from_drive"] is True
+    assert out["status"]["state"] == "ended"
+    assert not any(drive.reachable(f) for f in drive.files)
+
+
+def test_reactivate_via_api(client, drive, invoice_pdf, env):
+    link = upload(client, invoice_pdf).json()
+    conn = db.connect(env.db_path)
+    db.set_expiry(conn, link["id"], expiry_instant(today() - timedelta(days=1), TZ))
+    conn.close()
+    swept = client.post("/api/maintenance/sweep", headers=AUTH).json()
+    assert swept["removed"] == 1
+
+    gone = client.get(f"/api/links/{link['id']}", headers=AUTH).json()
+    assert gone["status"]["state"] == "expired" and gone["actions"]["reactivate"]
+
+    back = client.post(f"/api/links/{link['id']}/reactivate", json={"preset_days": 7}, headers=AUTH).json()
+    assert back["status"]["state"] == "active"
+    assert back["drive_url"] == link["drive_url"]
+
+
+def test_unknown_link_is_404(client):
+    for method, path in [("get", "/api/links/999"), ("get", "/api/links/999/qr.png"),
+                         ("post", "/api/links/999/end")]:
+        assert getattr(client, method)(path, headers=AUTH).status_code == 404
+
+
+# ------------------------------------------------------------------ settings
+
+
+def test_default_limit_is_saved_and_offered(client):
+    assert client.get("/api/settings", headers=AUTH).json()["default_preset_days"] == 7
+    client.put("/api/settings", json={"default_preset_days": 30}, headers=AUTH)
+    status = client.get("/api/status", headers=AUTH).json()
+    assert status["limits"]["default_preset_days"] == 30
+
+
+def test_default_limit_must_be_a_preset(client):
+    assert client.put("/api/settings", json={"default_preset_days": 5}, headers=AUTH).status_code == 400
+
+
+def test_changing_the_default_does_not_touch_existing_links(client, invoice_pdf):
+    link = upload(client, invoice_pdf, preset_days=7).json()
+    client.put("/api/settings", json={"default_preset_days": 1}, headers=AUTH)
+    assert client.get(f"/api/links/{link['id']}", headers=AUTH).json()["last_day"] == link["last_day"]
+
+
+# -------------------------------------------------------------------- status
+
+
+def test_status_reports_drive_and_date_bounds(client):
+    s = client.get("/api/status", headers=AUTH).json()
+    # sign_in_url added by spec-docker (additive; None except while a Docker sign-in runs).
+    assert s["drive"] == {
+        "state": "connected",
+        "email": "tester@example.com",
+        "message": None,
+        "sign_in_url": None,
     }
+    assert s["limits"]["presets"] == [1, 3, 7, 30]
+    assert s["limits"]["today"] == today().isoformat()
+    assert s["limits"]["max_day"] == (today() + timedelta(days=365)).isoformat()
 
 
-def test_all_failure_modes_are_externally_indistinguishable(
-    client, invoice_pdf, conn
-) -> None:
-    cases = _make_failing_links(client, invoice_pdf, conn)
-    responses = {reason: client.get(f"/d/{tok}") for reason, tok in cases.items()}
+def test_limits_that_ran_out_while_the_laptop_was_off_are_removed_at_startup(env, drive, invoice_pdf):
+    """The core promise of section 5: starting the app catches up immediately."""
+    from fastapi.testclient import TestClient
 
-    for reason, r in responses.items():
-        assert r.status_code == 404, reason
+    from app.main import app
 
-    bodies = {r.text for r in responses.values()}
-    assert len(bodies) == 1, "failure pages differ; that leaks which tokens exist"
-
-    # And the page must not name the reason.
-    page = next(iter(bodies)).lower()
-    for word in ("expired", "revoked", "exhausted", "not found", "limit"):
-        assert word not in page, f"error page leaks the reason: {word!r}"
-
-
-def test_the_log_still_records_the_true_reason(client, invoice_pdf, conn) -> None:
-    """Opaque to the visitor, precise in the log. That is the whole design."""
-    cases = _make_failing_links(client, invoice_pdf, conn)
-    for reason, tok in cases.items():
-        client.get(f"/d/{tok}")
-        outcomes = [e["outcome"] for e in db.access_log_for(conn, tok)]
-        assert reason in outcomes, f"{reason} was not logged for {tok}"
-
-
-# ----------------------------------------------------------------- admin endpoints
-
-
-def test_metadata_never_exposes_the_storage_ref(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    meta = client.get(f"/api/files/{token}", headers=AUTH).json()
-    assert "storage_ref" not in meta
-    assert meta["status"] == db.OUTCOME_SERVED
-    assert meta["url"].endswith(token)
-
-
-def test_metadata_reports_download_count(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    for _ in range(3):
-        client.get(f"/d/{token}")
-    assert client.get(f"/api/files/{token}", headers=AUTH).json()["download_count"] == 3
-
-
-def test_revoke_endpoint_kills_a_live_link(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    assert client.get(f"/d/{token}").status_code == 200
-    r = client.post(f"/api/files/{token}/revoke", headers=AUTH).json()
-    assert r["revoked"] is True and r["already_revoked"] is False
-    assert client.get(f"/d/{token}").status_code == 404
-    assert (
-        client.post(f"/api/files/{token}/revoke", headers=AUTH).json()["already_revoked"]
-        is True
+    db.init_db(env.db_path)
+    conn = db.connect(env.db_path)
+    up = drive.upload(invoice_pdf.read_bytes(), "q.pdf")
+    drive.share_public(up.id)
+    db.insert_link(
+        conn, drive_file_id=up.id, drive_url=up.url, filename="q.pdf", size_bytes=1,
+        sha256="x", label=None, expires_at=datetime.now(TZ) - timedelta(hours=1),
     )
+    conn.close()
+    assert drive.reachable(up.id)
+
+    app.state.drive_override = drive
+    app.state.tz = TZ
+    try:
+        with TestClient(app) as c:
+            # The first sweep runs as the app starts; wait for it deterministically.
+            for _ in range(50):
+                if app.state.last_sweep:
+                    break
+                c.get("/healthz")
+            assert app.state.last_sweep and app.state.last_sweep["removed"] == 1
+    finally:
+        del app.state.drive_override
+        del app.state.tz
+    assert not drive.reachable(up.id)
 
 
-def test_log_endpoint_separates_served_from_attempts(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf, max_downloads=2).json()["token"]
-    for _ in range(5):
-        client.get(f"/d/{token}")
-    log = client.get(f"/api/files/{token}/log", headers=AUTH).json()
-    assert log["served"] == 2
-    assert log["attempts"] == 5
-
-
-def test_log_truncates_the_caller_ip(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    client.get(f"/d/{token}")
-    entry = client.get(f"/api/files/{token}/log", headers=AUTH).json()["entries"][0]
-    assert entry["ip"] is None or entry["ip"].endswith(("/24", "/64"))
-
-
-def test_qr_endpoint_returns_a_png(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    r = client.get(f"/api/files/{token}/qr.png", headers=AUTH)
-    assert r.headers["content-type"] == "image/png"
-    assert r.content.startswith(b"\x89PNG")
-
-
-def test_admin_lookups_404_on_unknown_token(client) -> None:
-    for path in ("", "/log", "/qr.png"):
-        assert client.get(f"/api/files/unknown000000000000{path}", headers=AUTH).status_code == 404
-    assert client.post("/api/files/unknown000000000000/revoke", headers=AUTH).status_code == 404
-
-
-def test_list_endpoint_returns_uploads(client, sample_pdfs) -> None:
-    for pdf in sample_pdfs:
-        upload(client, pdf)
-    links = client.get("/api/files", headers=AUTH).json()["links"]
-    assert len(links) == len(sample_pdfs)
-    assert all("storage_ref" not in link for link in links)
-
-
-def test_download_sets_protective_headers(client, invoice_pdf) -> None:
-    token = upload(client, invoice_pdf).json()["token"]
-    r = client.get(f"/d/{token}")
-    assert r.headers["cache-control"] == "no-store"
-    assert r.headers["x-content-type-options"] == "nosniff"
-    assert "90374749.pdf" in r.headers["content-disposition"]
+def test_status_warns_when_expired_links_are_stuck(client, drive, invoice_pdf, env):
+    link = upload(client, invoice_pdf).json()
+    conn = db.connect(env.db_path)
+    db.set_expiry(conn, link["id"], expiry_instant(today() - timedelta(days=1), TZ))
+    conn.close()
+    drive.connected = False
+    client.post("/api/maintenance/sweep", headers=AUTH)
+    s = client.get("/api/status", headers=AUTH).json()["last_sweep"]
+    assert s["pending"] == 1 and s["drive_not_connected"] is True

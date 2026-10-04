@@ -1,5 +1,6 @@
 -r requirements.txt
 pytest==8.3.4
 httpx==0.28.1
-pyzbar==0.1.9          # QR decoding — used to prove round-trip fidelity in tests
+pyzbar==0.1.9          # QR decoding: proves every QR round-trips to the right link
 pypdf==6.0.0
+tzdata==2025.2         # IANA time zones on Windows, for the daylight-saving tests

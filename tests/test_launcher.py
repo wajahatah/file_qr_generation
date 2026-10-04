@@ -1,15 +1,11 @@
-"""start.cmd's BASE_URL resolution.
-
-BASE_URL is baked into every QR at generation time. If it does not match the origin
-the server is actually reachable at, the codes point nowhere -- and nothing fails
-loudly, because a wrong-but-well-formed URL still renders a perfectly good QR. Hence
-these tests.
-"""
+"""start.cmd and its helper."""
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -18,85 +14,102 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import setup_helper  # noqa: E402
 
+START_CMD = (ROOT / "start.cmd").read_bytes()
+
 
 @pytest.fixture
 def env_file(tmp_path, monkeypatch):
-    """Point the helper at a throwaway .env."""
     path = tmp_path / ".env"
     monkeypatch.setattr(setup_helper, "ENV", path)
+    monkeypatch.setattr(setup_helper, "EXAMPLE", ROOT / ".env.example")
+    monkeypatch.setattr(setup_helper, "ROOT", tmp_path)
     return path
 
 
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        ("http://localhost:8000", True),
-        ("http://127.0.0.1:8000", True),
-        ("http://0.0.0.0:8000", True),
-        ("http://192.168.2.106:8000", True),
-        ("http://10.0.0.5", True),
-        ("http://172.16.4.4", True),
-        ("http://172.32.4.4", False),  # outside the private 172.16/12 range
-        ("https://qr.example.com", False),
-        ("https://qr.abunayyan.com.sa", False),
-    ],
-)
-def test_is_local_classification(url: str, expected: bool) -> None:
-    assert setup_helper.is_local(url) is expected
+# ----------------------------------------------------------- network exposure
 
 
-def test_a_production_base_url_is_never_overridden(env_file) -> None:
-    """A real domain in .env is a deliberate setting and must survive any port arg."""
-    env_file.write_text("BASE_URL=https://qr.abunayyan.com.sa\n", encoding="utf-8")
-    assert setup_helper.resolve_base_url("8000", lan=False) == "https://qr.abunayyan.com.sa"
-    assert setup_helper.resolve_base_url("9999", lan=True) == "https://qr.abunayyan.com.sa"
+def test_app_listens_on_this_laptop_only():
+    """Spec 8.4: nothing on the network can connect, not even the same Wi-Fi."""
+    text = START_CMD.decode("utf-8")
+    assert re.search(r"uvicorn app\.main:app --host 127\.0\.0\.1 ", text)
+    assert "0.0.0.0" not in text
 
 
-def test_a_local_base_url_follows_the_port_actually_in_use(env_file) -> None:
-    """The regression this file exists for.
-
-    Start once on port 8123 and .env records localhost:8123. Start again with no
-    arguments and the server listens on 8000 -- every QR issued would encode the
-    stale 8123 and resolve to nothing.
-    """
-    env_file.write_text("BASE_URL=http://localhost:8123\n", encoding="utf-8")
-    assert setup_helper.resolve_base_url("8000", lan=False) == "http://localhost:8000"
+def test_lan_mode_is_gone():
+    text = START_CMD.decode("utf-8")
+    assert "LANMODE" not in text and '"lan"' not in text.lower()
+    assert "lanip" not in text and "baseurl" not in text
 
 
-def test_missing_env_falls_back_to_localhost(env_file) -> None:
-    assert setup_helper.resolve_base_url("8000", lan=False) == "http://localhost:8000"
+def test_start_cmd_has_windows_line_endings():
+    assert START_CMD.count(b"\r\n") == START_CMD.count(b"\n"), "bare LF breaks cmd.exe blocks"
 
 
-def test_lan_mode_uses_a_routable_address(env_file, monkeypatch) -> None:
-    monkeypatch.setattr(setup_helper, "lan_ip", lambda: "192.168.2.106")
-    url = setup_helper.resolve_base_url("8000", lan=True)
-    assert url == "http://192.168.2.106:8000"
-    assert "localhost" not in url, "a phone cannot resolve localhost to this machine"
+def test_gitattributes_keeps_cmd_files_crlf():
+    assert "*.cmd text eol=crlf" in (ROOT / ".gitattributes").read_text(encoding="utf-8")
 
 
-def test_bootstrap_generates_a_strong_token_and_never_clobbers(env_file, monkeypatch) -> None:
-    monkeypatch.setattr(setup_helper, "EXAMPLE", ROOT / ".env.example")
+def test_launcher_checks_for_the_google_libraries():
+    text = START_CMD.decode("utf-8")
+    for mod in ("google_auth_oauthlib", "keyring", "googleapiclient"):
+        assert mod in text
 
-    setup_helper.bootstrap("8000")
+
+# ------------------------------------------------------------------ bootstrap
+
+
+def test_bootstrap_generates_a_strong_token_and_never_clobbers(env_file):
+    setup_helper.bootstrap()
     first = env_file.read_text(encoding="utf-8")
-    token = next(l.split("=", 1)[1] for l in first.splitlines() if l.startswith("ADMIN_TOKEN="))
+    token = re.search(r"^ADMIN_TOKEN=(.+)$", first, re.M).group(1)
+    assert len(token) >= 32 and token not in setup_helper.PLACEHOLDER_TOKENS
 
-    assert len(token) >= 32, "generated admin token is too short"
-    assert token not in ("change-me", "dev-admin-token-change-me")
-    assert "BASE_URL=http://localhost:8000" in first
-
-    # Running start.cmd again must not overwrite the operator's settings.
     env_file.write_text(first + "\nCUSTOM=kept\n", encoding="utf-8")
-    setup_helper.bootstrap("8000")
+    setup_helper.bootstrap()
     assert "CUSTOM=kept" in env_file.read_text(encoding="utf-8")
 
 
-def test_helper_parses_env_ignoring_comments_and_blanks(env_file) -> None:
-    env_file.write_text(
-        "# a comment\n\nBASE_URL=https://x.test\n  ADMIN_TOKEN = abc \nMALFORMED\n",
-        encoding="utf-8",
-    )
-    env = setup_helper.read_env()
-    assert env["BASE_URL"] == "https://x.test"
-    assert env["ADMIN_TOKEN"] == "abc"
-    assert "MALFORMED" not in env
+def test_env_example_has_no_laptop_serving_settings():
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for gone in ("BASE_URL", "STORAGE_BACKEND", "DRIVE_FOLDER_ID", "SERVICE_ACCOUNT"):
+        assert gone not in text
+
+
+def test_summary_warns_when_google_is_not_set_up(env_file, capsys):
+    env_file.write_text("ADMIN_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789\n", encoding="utf-8")
+    setup_helper.summary("8000")
+    out = capsys.readouterr().out
+    assert "http://localhost:8000/admin" in out
+    assert "client_secret.json is missing" in out
+
+
+def test_summary_is_quiet_when_everything_is_set_up(env_file, capsys):
+    env_file.write_text("ADMIN_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789\n", encoding="utf-8")
+    (env_file.parent / "client_secret.json").write_text("{}", encoding="utf-8")
+    setup_helper.summary("8000")
+    assert "[!]" not in capsys.readouterr().out
+
+
+def test_read_env_ignores_comments_and_blanks(env_file):
+    env_file.write_text("# c\n\nADMIN_TOKEN = abc \nMALFORMED\n", encoding="utf-8")
+    assert setup_helper.read_env() == {"ADMIN_TOKEN": "abc"}
+
+
+# ------------------------------------------------------------ opening the app
+
+
+def test_browser_opens_once_the_app_answers():
+    resp = mock.MagicMock(status=200)
+    resp.__enter__.return_value = resp
+    with mock.patch("urllib.request.urlopen", side_effect=[OSError("not yet"), resp]), \
+         mock.patch("webbrowser.open") as open_, mock.patch("time.sleep"):
+        setup_helper.open_when_ready("8123")
+    open_.assert_called_once_with("http://localhost:8123/admin")
+
+
+def test_browser_is_not_opened_if_the_app_never_starts():
+    with mock.patch("urllib.request.urlopen", side_effect=OSError("down")), \
+         mock.patch("webbrowser.open") as open_, mock.patch("time.sleep"):
+        setup_helper.open_when_ready("8123", timeout=0.01)
+    open_.assert_not_called()

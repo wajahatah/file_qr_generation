@@ -1,6 +1,10 @@
 # Spec — QR-Based Secure File Delivery (Phase 1)
 
-- **Status:** APPROVED 2026-09-20 — IMPLEMENTED. See [../qr-file-share.md](../qr-file-share.md).
+- **Status:** APPROVED 2026-09-20 — IMPLEMENTED — **SUPERSEDED IN PART 2026-09-28** by
+  [spec-admin-ui.md](spec-admin-ui.md). Delivery moved to Google Drive; the laptop no
+  longer serves files. Decisions D1, D2, D3 and the `/d/{token}` route, download caps
+  and access log are replaced. This phase is preserved at git tag
+  `phase-1-laptop-delivery`.
 - **Author:** Claude (Opus 5), on behalf of Wajahat Ahmed
 - **Date:** 2026-09-19
 - **Scope:** QR generation + scan-to-file delivery only. Quotation/report *generation* is Phase 2 and is explicitly out of scope here.

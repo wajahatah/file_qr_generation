@@ -1,0 +1,15 @@
+{
+  "name": "QR File Share",
+  "short_name": "QR Share",
+  "description": "Share PDFs by QR code from Google Drive, with a time limit.",
+  "start_url": "/admin",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f5f8",
+  "theme_color": "#2952cc",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

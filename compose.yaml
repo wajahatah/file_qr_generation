@@ -1,0 +1,40 @@
+# QR File Share in Docker. Start with docker-start.cmd (recommended) or:
+#   docker compose up -d --build
+# See HOW-TO-RUN.md, "Run with Docker".
+name: qr-file-share
+
+services:
+  app:
+    build: .
+    image: qr-file-share:latest
+    # Always on: comes back whenever Docker Desktop starts, so expired QR codes are
+    # removed whenever the laptop is on (spec-docker 3.5).
+    restart: unless-stopped
+    ports:
+      # Laptop's 127.0.0.1 ONLY. Never "8000:8000" -- that would expose the app to
+      # the whole network.
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+      # Google sends you back here after sign-in. Must be the same number both sides.
+      - "127.0.0.1:8766:8766"
+    # Only these values are passed in -- deliberately NOT env_file: .env. The native
+    # .env also holds DB_PATH and GOOGLE_CLIENT_SECRET_FILE, which would move the
+    # database out of the volume and lose every issued QR code on rebuild.
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env - copy .env.example to .env}
+      ADMIN_SESSION_HOURS: ${ADMIN_SESSION_HOURS:-12}
+      SWEEP_INTERVAL_MINUTES: ${SWEEP_INTERVAL_MINUTES:-10}
+      TZ: ${TZ:-}
+      HOST_WINDOWS_TZ: ${HOST_WINDOWS_TZ:-}
+    volumes:
+      - qr-data:/data
+    secrets:
+      - client_secret
+
+secrets:
+  client_secret:
+    file: ./client_secret.json
+
+volumes:
+  # Database and Google sign-in token. Survives restarts, rebuilds and
+  # `docker compose down`; only `docker compose down -v` deletes it.
+  qr-data:

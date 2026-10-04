@@ -1,0 +1,36 @@
+# QR File Share -- kit version {{VERSION}}. Start with docker-start.cmd.
+#
+# Runs the image shipped in this kit. Never builds, never downloads: the image is
+# loaded from qr-file-share-image-<cpu>.tar by docker-start.cmd.
+name: qr-file-share
+
+services:
+  app:
+    image: qr-file-share:{{VERSION}}
+    pull_policy: never
+    # Always on: comes back whenever Docker Desktop starts.
+    restart: unless-stopped
+    ports:
+      # This laptop only (127.0.0.1) -- never reachable from the network.
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+      # Google sends you back here after sign-in. Same number on both sides.
+      - "127.0.0.1:8766:8766"
+    # Named values only, never the whole .env (see the project's compose.yaml).
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env - copy .env.example to .env}
+      ADMIN_SESSION_HOURS: ${ADMIN_SESSION_HOURS:-12}
+      SWEEP_INTERVAL_MINUTES: ${SWEEP_INTERVAL_MINUTES:-10}
+      TZ: ${TZ:-}
+      HOST_WINDOWS_TZ: ${HOST_WINDOWS_TZ:-}
+    volumes:
+      - qr-data:/data
+    secrets:
+      - client_secret
+
+secrets:
+  client_secret:
+    file: ./client_secret.json
+
+volumes:
+  # QR codes, settings and the Google sign-in. Kept when you install a newer kit.
+  qr-data:

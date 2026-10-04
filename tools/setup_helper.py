@@ -1,41 +1,32 @@
-"""Helper invoked by start.cmd. Not part of the running service.
+"""Helper invoked by start.cmd. Not part of the running app.
 
 Subcommands:
-  bootstrap   create .env from .env.example on first run, with a generated admin token
-  baseurl     print the BASE_URL this run should use (see resolve_base_url)
-  summary     print the effective configuration, with warnings for bad combinations
-  lanip       print this machine's LAN IP (for testing a scan from a real phone)
+  bootstrap              create .env on first run, with a generated admin token
+  summary <port>         print how to open the app, and what still needs setting up
+  openwhenready <port>   wait until the app answers, then open it in the browser
 """
 
 from __future__ import annotations
 
 import re
 import secrets
-import socket
 import sys
+import time
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV = ROOT / ".env"
 EXAMPLE = ROOT / ".env.example"
 
-
-def lan_ip() -> str:
-    """Best-effort LAN address. No packets are sent; connect() on UDP just picks a route."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+PLACEHOLDER_TOKENS = ("change-me", "dev-admin-token-change-me", "")
 
 
 def read_env() -> dict[str, str]:
     if not ENV.exists():
         return {}
-    out = {}
+    out: dict[str, str] = {}
     for line in ENV.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -45,98 +36,60 @@ def read_env() -> dict[str, str]:
     return out
 
 
-def bootstrap(port: str) -> None:
+def bootstrap() -> None:
     if ENV.exists():
         print("[3/4] .env found - leaving your settings untouched.")
         return
-
     token = secrets.token_urlsafe(32)
     text = EXAMPLE.read_text(encoding="utf-8")
-    text = re.sub(r"^BASE_URL=.*$", f"BASE_URL=http://localhost:{port}", text, flags=re.M)
     text = re.sub(r"^ADMIN_TOKEN=.*$", f"ADMIN_TOKEN={token}", text, flags=re.M)
     ENV.write_text(text, encoding="utf-8")
-
     print("[3/4] Created .env with a freshly generated admin token.")
-    print("      Edit .env to change storage backend, expiry, or the public URL.")
 
 
-LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0")
-
-
-def is_local(url: str) -> bool:
-    host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
-    return host in LOCAL_HOSTS or re.fullmatch(r"(10|192\.168|172\.(1[6-9]|2\d|3[01]))\..*", host) is not None
-
-
-def resolve_base_url(port: str, lan: bool) -> str:
-    """Decide the BASE_URL for this run.
-
-    BASE_URL is baked into every QR at generation time, so it must match the origin
-    the server is actually reachable at -- otherwise the codes point nowhere.
-
-    A real (non-local) BASE_URL in .env is a deliberate production setting and always
-    wins. A local one is treated as a dev default and is re-derived from the port
-    actually being used, which stops a QR from encoding a stale port after someone
-    starts the server on a different one.
-    """
-    configured = read_env().get("BASE_URL", "")
-    if configured and not is_local(configured):
-        return configured
-    host = lan_ip() if lan else "localhost"
-    return f"http://{host}:{port}"
-
-
-def summary(base_url: str) -> None:
+def summary(port: str) -> None:
     env = read_env()
-    backend = env.get("STORAGE_BACKEND", "local")
-    token = env.get("ADMIN_TOKEN", "(unset)")
+    token = env.get("ADMIN_TOKEN", "")
+    secret_file = ROOT / env.get("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
 
     print()
-    print("  Server URL       :  " + base_url)
-    print("  API docs         :  " + base_url + "/docs")
-    print("  Storage backend  :  " + backend)
-    print("  Admin token      :  " + token)
+    print(f"  App              :  http://localhost:{port}/admin")
+    print(f"  Admin token      :  {token or '(missing)'}")
     print()
 
-    warnings = []
-    if token in ("change-me", "dev-admin-token-change-me"):
-        warnings.append("ADMIN_TOKEN is still the placeholder. Change it in .env.")
-    if backend == "drive":
-        if not env.get("DRIVE_FOLDER_ID"):
-            warnings.append("STORAGE_BACKEND=drive but DRIVE_FOLDER_ID is empty.")
-        key = ROOT / env.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
-        if not key.exists():
-            warnings.append(f"Service account key not found at {key}")
-        if warnings:
-            warnings.append("See docs/setup-guide.md section 5.")
-    if base_url.startswith(("http://localhost", "http://127.")):
-        warnings.append(
-            "QR codes will only work on THIS machine.\n"
-            "        To scan with your phone, stop and run:  start.cmd lan"
-        )
-    elif is_local(base_url):
-        warnings.append(
-            "LAN mode: QR codes work only for devices on this Wi-Fi network,\n"
-            "        and stop working when this machine's IP changes."
-        )
-
-    for w in warnings:
-        print("  [!] " + w)
-    if warnings:
+    if token in PLACEHOLDER_TOKENS:
+        print("  [!] ADMIN_TOKEN is not set to a real value. Edit .env.")
+    if not secret_file.exists():
+        print(f"  [!] Google Drive is not set up yet: {secret_file.name} is missing.")
+        print("      The app opens, but cannot create QR codes until it is.")
+        print("      See docs/setup-guide.md, section 3.")
         print()
+
+
+def open_when_ready(port: str, timeout: float = 30.0) -> None:
+    url = f"http://localhost:{port}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{url}/healthz", timeout=2) as resp:
+                if resp.status == 200:
+                    webbrowser.open(f"{url}/admin")
+                    return
+        except OSError:
+            pass
+        time.sleep(0.5)
+    # Silent failure is fine: start.cmd already printed the address to open by hand.
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "lanip":
-        print(lan_ip())
-    elif cmd == "baseurl":
-        port = sys.argv[2] if len(sys.argv) > 2 else "8000"
-        print(resolve_base_url(port, lan=(len(sys.argv) > 3 and sys.argv[3] == "lan")))
-    elif cmd == "bootstrap":
-        bootstrap(sys.argv[2] if len(sys.argv) > 2 else "8000")
+    port = sys.argv[2] if len(sys.argv) > 2 else "8000"
+    if cmd == "bootstrap":
+        bootstrap()
     elif cmd == "summary":
-        summary(sys.argv[2] if len(sys.argv) > 2 else "http://localhost:8000")
+        summary(port)
+    elif cmd == "openwhenready":
+        open_when_ready(port)
     else:
         print(__doc__)
         sys.exit(1)
